@@ -49,7 +49,7 @@ reload_dataset = False # if reload already processed h_dataset
 if test:
     restart = True
 
-model_type = "dehnn" #this can be one of ["dehnn", "dehnn_att", "digcn", "digat"] "dehnn_att" might need large memory usage
+model_type = "dehnn" # one of ["dehnn", "dehnn_att", "digcn", "digat", "sheaf_ode", "cell_complex", "cell_complex_att"]
 num_layer = 3 #large number will cause OOM
 num_dim = 32 #large number will cause OOM
 vn = False #use virtual node or not
@@ -57,6 +57,15 @@ trans = False #use transformer or not
 aggr = "add" #use aggregation as one of ["add", "max"]
 device = "cuda" #use cuda or cpu
 learning_rate = 0.001
+
+# Sheaf ODE hyperparameters
+ode_T = 1.0            # ODE integration time
+ode_tol = 1e-3         # ODE solver tolerance
+ode_method = 'dopri5'  # ODE solver method: 'dopri5', 'euler', 'rk4'
+
+# Subgraph sampling (helps when number of graphs is small)
+use_subgraph = False   # partition-based subgraph sampling
+edge_dropout = 0.2     # edge dropout rate
 
 if not reload_dataset:
     dataset = NetlistDataset(data_dir="data/superblue", load_pe = True, pl = True, processed = True, load_indices=None)
@@ -88,6 +97,19 @@ if not reload_dataset:
         
         h_data['design_name'] = data['design_name']
         h_data.num_instances = data.node_features.shape[0]
+
+        # Build cell complex if needed
+        if model_type in ['cell_complex', 'cell_complex_att']:
+            sys.path.insert(1, 'data/')
+            from cell_complex_utils import build_cell_complex
+            cc_data = build_cell_complex(
+                edge_index_node_to_net=h_data['node', 'to', 'net'].edge_index,
+                edge_type=h_data['node', 'to', 'net'].edge_type,
+                num_nodes=num_instances,
+                num_nets=data.net_features.shape[0]
+            )
+            h_data['cell_complex'] = cc_data
+
         variant_data_lst = []
         
         node_demand = data.node_demand
@@ -121,7 +143,7 @@ h_data = h_dataset[0]
 if restart:
     model = torch.load(f"{model_type}_{num_layer}_{num_dim}_{vn}_{trans}_model.pt")
 else:
-    model = GNN_node(num_layer, num_dim, 1, 1, node_dim = h_data['node'].x.shape[1], net_dim = h_data['net'].x.shape[1], gnn_type=model_type, vn=vn, trans=trans, aggr=aggr, JK="Normal").to(device)
+    model = GNN_node(num_layer, num_dim, 1, 1, node_dim = h_data['node'].x.shape[1], net_dim = h_data['net'].x.shape[1], gnn_type=model_type, vn=vn, trans=trans, aggr=aggr, JK="Normal", ode_T=ode_T, ode_tol=ode_tol, ode_method=ode_method).to(device)
 
 criterion_node = nn.MSELoss()
 criterion_net = nn.MSELoss()

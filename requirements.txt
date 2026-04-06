@@ -8,3 +8,4 @@ rsa==4.9
 scipy==1.10.1
 yacs==0.1.8
 torch_geometric==2.5.3
+torchdiffeq>=0.2.3
