@@ -149,22 +149,35 @@ class CellComplexConvLayer(nn.Module):
         source_mask = edge_type_node_to_net == 1
         sink_mask = ~source_mask
 
-        # B1^T: 1-cell → 0-cell (flip B1_index for reverse direction)
-        B1_T_index = B1_index.flip(0)  # (2, B1_E): [1-cell, 0-cell] → [0-cell src, 1-cell dst] reversed
-        # B2^T: 2-cell → 1-cell
-        B2_T_index = B2_index.flip(0)
+        # Edge index conventions for bipartite conv ((x_src, x_dst), edge_index):
+        #   edge_index[0] indexes into x_src, edge_index[1] indexes into x_dst
+        #
+        # B1_index = [0-cell, 1-cell]  (original boundary operator)
+        # B2_index = [1-cell, 2-cell]  (original boundary operator)
+
+        # 1-cell → 0-cell: src=1-cell, dst=0-cell → need [1-cell, 0-cell]
+        B1_1to0 = B1_index.flip(0).to(device)
+        # 0-cell → 1-cell: src=0-cell, dst=1-cell → need [0-cell, 1-cell]
+        B1_0to1 = B1_index.to(device)
+        # 2-cell → 1-cell: src=2-cell, dst=1-cell → need [2-cell, 1-cell]
+        B2_2to1 = B2_index.flip(0).to(device)
+        # 1-cell → 2-cell: src=1-cell, dst=2-cell → need [1-cell, 2-cell]
+        B2_1to2 = B2_index.to(device)
+
+        B1_w = B1_weight.abs().to(device)  # Use abs for aggregation weights
+        B2_w = B2_weight.abs().to(device)
 
         # =============================================
         # 1. UPDATE 0-CELLS (nodes)
         # =============================================
-        # Aggregate from 1-cells via B1^T
+        # Aggregate from 1-cells via B1^T (1-cell → 0-cell)
         if self.att:
             h_from_1cell = self.conv_1cell_to_node(
-                (x_1cell, x_node), B1_index.to(device)
+                (x_1cell, x_node), B1_1to0
             ) + x_node
         else:
             h_from_1cell = self.conv_1cell_to_node(
-                (x_1cell, x_node), B1_index.to(device), B1_weight.to(device)
+                (x_1cell, x_node), B1_1to0, B1_w
             ) + x_node
 
         # Aggregate from 2-cells (net→node) with source/sink split
@@ -196,24 +209,24 @@ class CellComplexConvLayer(nn.Module):
         # =============================================
         # 2. UPDATE 1-CELLS (edges)
         # =============================================
-        # From boundary 0-cells via B1
+        # From boundary 0-cells via B1 (0-cell → 1-cell)
         if self.att:
             h_from_node = self.conv_node_to_1cell(
-                (x_node, x_1cell), B1_T_index.to(device)
+                (x_node, x_1cell), B1_0to1
             ) + x_1cell
         else:
             h_from_node = self.conv_node_to_1cell(
-                (x_node, x_1cell), B1_T_index.to(device), B1_weight.to(device)
+                (x_node, x_1cell), B1_0to1, B1_w
             ) + x_1cell
 
-        # From co-boundary 2-cells via B2^T
+        # From co-boundary 2-cells via B2^T (2-cell → 1-cell)
         if self.att:
             h_from_net_edge = self.conv_net_to_1cell(
-                (x_net, x_1cell), B2_index.to(device)
+                (x_net, x_1cell), B2_2to1
             ) + x_1cell
         else:
             h_from_net_edge = self.conv_net_to_1cell(
-                (x_net, x_1cell), B2_index.to(device), B2_weight.to(device)
+                (x_net, x_1cell), B2_2to1, B2_w
             ) + x_1cell
 
         x_1cell_out = self.edge_update(
@@ -223,14 +236,14 @@ class CellComplexConvLayer(nn.Module):
         # =============================================
         # 3. UPDATE 2-CELLS (nets)
         # =============================================
-        # From boundary 1-cells via B2
+        # From boundary 1-cells via B2 (1-cell → 2-cell)
         if self.att:
             h_from_1cell_net = self.conv_1cell_to_net(
-                (x_1cell, x_net), B2_T_index.to(device)
+                (x_1cell, x_net), B2_1to2
             ) + x_net
         else:
             h_from_1cell_net = self.conv_1cell_to_net(
-                (x_1cell, x_net), B2_T_index.to(device), B2_weight.to(device)
+                (x_1cell, x_net), B2_1to2, B2_w
             ) + x_net
 
         # From 0-cells (node→net) with source/sink split

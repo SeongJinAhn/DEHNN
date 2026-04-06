@@ -248,12 +248,70 @@ class SheafODEBlock(nn.Module):
         super().__init_subclass__(**kwargs)
 
 
+class _SheafODEFuncModule(nn.Module):
+    """nn.Module wrapper for the ODE function (required by odeint_adjoint).
+
+    Graph-specific data (edge_index, restriction_maps, sizes) is set
+    dynamically via set_graph_data() before each ODE solve.
+    """
+
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.sigma = nn.Parameter(torch.tensor(1.0))
+        time_dim = 8
+        self.source_term = Seq(
+            Linear(emb_dim + time_dim, emb_dim),
+            LeakyReLU(),
+            Linear(emb_dim, emb_dim),
+        )
+        self.register_buffer('time_freqs', torch.tensor([1.0, 2.0, 4.0, 8.0]))
+
+        # Placeholders for graph data (set per forward call)
+        self.edge_index = None
+        self.restriction_maps = None
+        self.num_nodes = 0
+        self.num_nets = 0
+
+    def set_graph_data(self, edge_index, restriction_maps, num_nodes, num_nets):
+        self.edge_index = edge_index
+        self.restriction_maps = restriction_maps
+        self.num_nodes = num_nodes
+        self.num_nets = num_nets
+
+    def forward(self, t, x):
+        x_node = x[:self.num_nodes]
+        x_net = x[self.num_nodes:]
+
+        node_idx = self.edge_index[0]
+        net_idx = self.edge_index[1]
+        F = self.restriction_maps
+
+        # Sheaf Laplacian via scatter
+        msg = F * (x_node[node_idx] - x_net[net_idx])
+        Lx_node = scatter(F * msg, node_idx, dim=0,
+                          dim_size=self.num_nodes, reduce='add')
+        Lx_net = scatter(-F * msg, net_idx, dim=0,
+                         dim_size=self.num_nets, reduce='add')
+        Lx = torch.cat([Lx_node, Lx_net], dim=0)
+
+        # Time embedding
+        freqs = self.time_freqs * t
+        t_emb = torch.cat([torch.sin(freqs), torch.cos(freqs)])
+        t_emb = t_emb.unsqueeze(0).expand(x.shape[0], -1)
+
+        # Source term
+        g = self.source_term(torch.cat([x, t_emb], dim=-1))
+
+        return -self.sigma * Lx + g
+
+
 class SheafODEBlockV2(nn.Module):
-    """Improved version with persistent ODE function parameters.
+    """Sheaf ODE block with proper nn.Module ODE function.
 
     The ODE function's learnable parameters (sigma, source_term MLP)
-    are owned by this module, ensuring they're properly tracked by
-    the optimizer. The graph topology is set dynamically per forward call.
+    are owned by this module via a sub-module, ensuring they're properly
+    tracked by the optimizer and compatible with odeint_adjoint.
     """
 
     def __init__(self, emb_dim, ode_T=1.0, ode_tol=1e-3, ode_method='dopri5'):
@@ -266,15 +324,8 @@ class SheafODEBlockV2(nn.Module):
         # Restriction map generator
         self.restriction_mlp = RestrictionMapMLP(emb_dim)
 
-        # Persistent ODE function parameters
-        self.sigma = nn.Parameter(torch.tensor(1.0))
-        time_dim = 8
-        self.source_term = Seq(
-            Linear(emb_dim + time_dim, emb_dim),
-            LeakyReLU(),
-            Linear(emb_dim, emb_dim),
-        )
-        self.time_freqs = torch.tensor([1.0, 2.0, 4.0, 8.0])
+        # ODE function as a proper nn.Module
+        self.odefunc = _SheafODEFuncModule(emb_dim)
 
     def forward(self, h_node, h_net,
                 edge_index_node_to_net, edge_weight_node_to_net,
@@ -286,54 +337,27 @@ class SheafODEBlockV2(nn.Module):
         num_nodes = h_node.shape[0]
         num_nets = h_net.shape[0]
 
-        # Compute restriction maps
+        # Compute restriction maps from current features
         restriction_maps = self.restriction_mlp(
             h_node, h_net,
             edge_index_node_to_net.to(device),
             edge_type_node_to_net.to(device)
         )
 
-        # Edge indices on device
-        edge_index = edge_index_node_to_net.to(device)
-        time_freqs = self.time_freqs.to(device)
-
-        # Closure-based ODE function to share this module's parameters
-        sigma = self.sigma
-        source_term = self.source_term
-        emb_dim = self.emb_dim
-
-        def odefunc(t, x):
-            x_node = x[:num_nodes]
-            x_net = x[num_nodes:]
-
-            node_idx = edge_index[0]
-            net_idx = edge_index[1]
-            F = restriction_maps
-
-            # Sheaf Laplacian
-            msg = F * (x_node[node_idx] - x_net[net_idx])
-            Lx_node = scatter(F * msg, node_idx, dim=0,
-                              dim_size=num_nodes, reduce='add')
-            Lx_net = scatter(-F * msg, net_idx, dim=0,
-                             dim_size=num_nets, reduce='add')
-            Lx = torch.cat([Lx_node, Lx_net], dim=0)
-
-            # Time embedding
-            freqs = time_freqs * t
-            t_emb = torch.cat([torch.sin(freqs), torch.cos(freqs)])
-            t_emb = t_emb.unsqueeze(0).expand(x.shape[0], -1)
-
-            # Source term
-            g = source_term(torch.cat([x, t_emb], dim=-1))
-
-            return -sigma * Lx + g
+        # Set graph-specific data on the ODE function
+        self.odefunc.set_graph_data(
+            edge_index=edge_index_node_to_net.to(device),
+            restriction_maps=restriction_maps,
+            num_nodes=num_nodes,
+            num_nets=num_nets,
+        )
 
         # Integrate
         x0 = torch.cat([h_node, h_net], dim=0)
         t_span = torch.tensor([0.0, self.T.abs().item()], device=device)
 
         x_out = odeint(
-            odefunc, x0, t_span,
+            self.odefunc, x0, t_span,
             method=self.ode_method,
             atol=self.ode_tol,
             rtol=self.ode_tol,
