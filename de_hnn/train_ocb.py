@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """
 Training script for Sheaf Hypergraph model on OCB (Open Circuit Benchmark).
 
@@ -212,7 +212,7 @@ def main():
 
         print(f"{epoch:5d} | {train_loss:10.4f} | {val_metrics['loss']:10.4f} | "
               f"{val_metrics['fom_mae']:8.4f} | {val_metrics['fom_r2']:8.4f} | "
-              f"{elapsed:5.1f}s")
+              f"{elapsed:5.1f}s", flush=True)
 
     # Final test evaluation
     print(f"\n{'='*60}")
