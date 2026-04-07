@@ -103,14 +103,12 @@ def build_h_dataset(data_dir, save_path):
 
 
 def train_epoch(model, h_dataset, train_indices, optimizer,
-                criterion_node, criterion_net, device,
-                consistency_weight=0.01):
+                criterion_node, criterion_net, device):
     """Train one epoch over all training designs."""
     model.train()
     np.random.shuffle(train_indices)
     loss_node_total = 0.0
     loss_net_total = 0.0
-    loss_consist_total = 0.0
     count = 0
 
     for data_idx in tqdm(train_indices, desc="Train", leave=False):
@@ -124,23 +122,21 @@ def train_epoch(model, h_dataset, train_indices, optimizer,
             data.num_vn = num_vn
             data.vn = vn_node
 
-            node_pred, net_pred, c_loss = model(data, device)
+            node_pred, net_pred = model(data, device)
             node_pred = torch.squeeze(node_pred)
             net_pred = torch.squeeze(net_pred)
 
             loss_node = criterion_node(node_pred, target_node.to(device))
             loss_net = criterion_net(net_pred, target_net_demand.to(device))
-            loss = loss_node + loss_net + consistency_weight * c_loss
+            loss = loss_node + loss_net
             loss.backward()
             optimizer.step()
 
             loss_node_total += loss_node.item()
             loss_net_total += loss_net.item()
-            loss_consist_total += c_loss.item()
             count += 1
 
-    return (loss_node_total / count, loss_net_total / count,
-            loss_consist_total / count)
+    return loss_node_total / count, loss_net_total / count
 
 
 @torch.no_grad()
@@ -161,7 +157,7 @@ def eval_epoch(model, h_dataset, indices, criterion_node, criterion_net, device)
             data.num_vn = num_vn
             data.vn = vn_node
 
-            node_pred, net_pred, _ = model(data, device)
+            node_pred, net_pred = model(data, device)
             node_pred = torch.squeeze(node_pred)
             net_pred = torch.squeeze(net_pred)
 
@@ -190,8 +186,6 @@ def main():
     parser.add_argument("--num_layer", type=int, default=3)
     parser.add_argument("--num_dim", type=int, default=32)
     parser.add_argument("--stalk_dim", type=int, default=4)
-    parser.add_argument("--rank", type=int, default=8,
-                        help="Rank of low-rank restriction map factorization")
     parser.add_argument("--vn", action="store_true", help="Use virtual node")
     parser.add_argument("--trans", action="store_true", help="Use transformer for VN")
     parser.add_argument("--aggr", type=str, default="add", choices=["add", "max"])
@@ -199,8 +193,6 @@ def main():
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--consistency_weight", type=float, default=0.01,
-                        help="Weight for sheaf consistency regularization loss")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -230,7 +222,7 @@ def main():
 
     # ── Model ──
     h_data = h_dataset[0]
-    model_name = f"sheaf_{args.num_layer}_{args.num_dim}_r{args.rank}_{args.vn}_{args.trans}_model.pt"
+    model_name = f"sheaf_{args.num_layer}_{args.num_dim}_{args.stalk_dim}_{args.vn}_{args.trans}_model.pt"
 
     if args.test or args.restart:
         print(f"Loading model from {model_name}")
@@ -242,7 +234,6 @@ def main():
             out_node_dim=1,
             out_net_dim=1,
             stalk_dim=args.stalk_dim,
-            rank=args.rank,
             node_dim=h_data['node'].x.shape[1],
             net_dim=h_data['net'].x.shape[1],
             vn=args.vn,
@@ -271,14 +262,13 @@ def main():
     best_train_loss = None
 
     print(f"\n{'Epoch':>5} | {'Train Node':>11} | {'Train Net':>11} | "
-          f"{'Consist':>9} | {'Val Node':>11} | {'Val Net':>11} | {'Best':>6}")
-    print("-" * 76)
+          f"{'Val Node':>11} | {'Val Net':>11}")
+    print("-" * 60)
 
     for epoch in range(1, args.epochs + 1):
-        train_node, train_net, train_consist = train_epoch(
+        train_node, train_net = train_epoch(
             model, h_dataset, train_indices,
-            optimizer, criterion_node, criterion_net, device,
-            consistency_weight=args.consistency_weight
+            optimizer, criterion_node, criterion_net, device
         )
 
         val_node, val_net = eval_epoch(
@@ -286,19 +276,15 @@ def main():
             criterion_node, criterion_net, device
         )
 
-        is_best = best_train_loss is None or train_node < best_train_loss
         print(f"{epoch:5d} | {train_node:11.6f} | {train_net:11.6f} | "
-              f"{train_consist:9.4f} | {val_node:11.6f} | {val_net:11.6f} | "
-              f"{'  *' if is_best else '':>6}", flush=True)
+              f"{val_node:11.6f} | {val_net:11.6f}", flush=True)
 
-        if is_best:
+        if best_train_loss is None or train_node < best_train_loss:
             best_train_loss = train_node
             torch.save(model, model_name)
 
-    print(f"\n{'='*76}")
-    print(f"Training complete. Best train node loss: {best_train_loss:.6f}")
+    print(f"\nBest train node loss: {best_train_loss:.6f}")
     print(f"Model saved to: {model_name}")
-    print(f"{'='*76}")
 
 
 if __name__ == "__main__":
