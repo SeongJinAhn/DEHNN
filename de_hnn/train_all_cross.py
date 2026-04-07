@@ -130,16 +130,28 @@ load_data_indices = [idx for idx in range(len(h_dataset))]
 all_train_indices, all_valid_indices, all_test_indices = load_data_indices[:10], load_data_indices[10:], load_data_indices[10:]
 best_total_val = None
 
+n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\n{'='*70}")
+print(f"Model: {model_type.upper()}, Layers: {num_layer}, Dim: {num_dim}, VN: {vn}, Trans: {trans}")
+print(f"Parameters: {n_params:,}")
+print(f"Train designs: {len(all_train_indices)}, Val designs: {len(all_valid_indices)}")
+print(f"Device: {device}")
+print(f"{'='*70}")
+
 if not test:
+    print(f"\n{'Epoch':>5} | {'Train Node':>11} | {'Train Net':>11} | "
+          f"{'Val Node':>11} | {'Val Net':>11} | {'Best':>6}")
+    print("-" * 70)
+
     for epoch in range(500):
         np.random.shuffle(all_train_indices)
         loss_node_all = 0
         loss_net_all = 0
         val_loss_node_all = 0
         val_loss_net_all = 0
-        
+
         all_train_idx = 0
-        for data_idx in tqdm(all_train_indices):
+        for data_idx in all_train_indices:
             data = h_dataset[data_idx]
             for inner_data_idx in range(len(data.variant_data_lst)):
                 target_node, target_net_hpwl, target_net_demand, batch, num_vn, vn_node = data.variant_data_lst[inner_data_idx]
@@ -150,20 +162,19 @@ if not test:
                 node_representation, net_representation = model(data, device)
                 node_representation = torch.squeeze(node_representation)
                 net_representation = torch.squeeze(net_representation)
-    
+
                 loss_node = criterion_node(node_representation, target_node.to(device))
                 loss_net = criterion_net(net_representation, target_net_demand.to(device))
                 loss = loss_node + loss_net
                 loss.backward()
-                optimizer.step()   
-    
+                optimizer.step()
+
                 loss_node_all += loss_node.item()
                 loss_net_all += loss_net.item()
                 all_train_idx += 1
-        print(loss_node_all/all_train_idx, loss_net_all/all_train_idx)
-    
+
         all_valid_idx = 0
-        for data_idx in tqdm(all_valid_indices):
+        for data_idx in all_valid_indices:
             data = h_dataset[data_idx]
             for inner_data_idx in range(len(data.variant_data_lst)):
                 target_node, target_net_hpwl, target_net_demand, batch, num_vn, vn_node = data.variant_data_lst[inner_data_idx]
@@ -173,22 +184,35 @@ if not test:
                 node_representation, net_representation = model(data, device)
                 node_representation = torch.squeeze(node_representation)
                 net_representation = torch.squeeze(net_representation)
-                
+
                 val_loss_node = criterion_node(node_representation, target_node.to(device))
                 val_loss_net = criterion_net(net_representation, target_net_demand.to(device))
                 val_loss_node_all +=  val_loss_node.item()
                 val_loss_net_all += val_loss_net.item()
                 all_valid_idx += 1
-        print(val_loss_node_all/all_valid_idx, val_loss_net_all/all_valid_idx)
-    
-        if (best_total_val is None) or ((loss_node_all/all_train_idx) < best_total_val):
-            best_total_val = loss_node_all/all_train_idx
+
+        train_node = loss_node_all / all_train_idx
+        train_net = loss_net_all / all_train_idx
+        val_node = val_loss_node_all / all_valid_idx
+        val_net = val_loss_net_all / all_valid_idx
+        is_best = (best_total_val is None) or (train_node < best_total_val)
+
+        print(f"{epoch+1:5d} | {train_node:11.6f} | {train_net:11.6f} | "
+              f"{val_node:11.6f} | {val_net:11.6f} | {'  *' if is_best else '':>6}", flush=True)
+
+        if is_best:
+            best_total_val = train_node
             torch.save(model, f"{model_type}_{num_layer}_{num_dim}_{vn}_{trans}_model.pt")
+
+    print(f"\n{'='*70}")
+    print(f"Training complete. Best train node loss: {best_total_val:.6f}")
+    print(f"Model saved to: {model_type}_{num_layer}_{num_dim}_{vn}_{trans}_model.pt")
+    print(f"{'='*70}")
 else:
     all_test_idx = 0
     test_loss_node_all = 0
     test_loss_net_all = 0
-    for data_idx in tqdm(all_test_indices):
+    for data_idx in all_test_indices:
         data = h_dataset[data_idx]
         for inner_data_idx in range(len(data.variant_data_lst)):
             target_node, target_net_hpwl, target_net_demand, batch, num_vn, vn_node = data.variant_data_lst[inner_data_idx]
@@ -198,11 +222,16 @@ else:
             node_representation, net_representation = model(data, device)
             node_representation = torch.squeeze(node_representation)
             net_representation = torch.squeeze(net_representation)
-            
+
             test_loss_node = criterion_node(node_representation, target_node.to(device))
             test_loss_net = criterion_net(net_representation, target_net_demand.to(device))
             test_loss_node_all +=  test_loss_node.item()
             test_loss_net_all += test_loss_net.item()
             all_test_idx += 1
-    print("avg test node demand mse: ", test_loss_node_all/all_test_idx)
-    print("avg test net demand mse: ", test_loss_net_all/all_test_idx)
+
+    print(f"\n{'='*70}")
+    print(f"Test Set Evaluation")
+    print(f"{'='*70}")
+    print(f"  Node demand MSE: {test_loss_node_all/all_test_idx:.6f}")
+    print(f"  Net demand MSE:  {test_loss_net_all/all_test_idx:.6f}")
+    print(f"{'='*70}")
