@@ -9,10 +9,10 @@ Data format (from CktGNN):
     - g_subgraph: igraph DAG of subcircuit blocks (type, subg_ntypes, r, c, gm)
     - g_full: igraph DAG of individual devices (type, feat)
 
-Hypergraph construction:
-  - Nodes = devices from g_full
-  - Hyperedges = subcircuit blocks from g_subgraph (grouping constituent devices)
-  - Falls back to star expansion when block membership can't be determined
+Hypergraph strategies:
+  - "block": Each subcircuit block = one hyperedge (devices grouped by block)
+  - "block_and_bridge": Block hyperedges + bridge hyperedges for inter-block edges
+  - "star": Star expansion fallback (each node + neighbors = one hyperedge)
 """
 
 import os
@@ -29,6 +29,10 @@ CKTGNN_REPO = "https://github.com/zehao-dong/CktGNN.git"
 
 # Number of device types in the full node-level DAG
 NUM_DEVICE_TYPES = 10  # types 0-9 observed in CktGNN data
+
+# Pseudo-node types in subg_ntypes that are NOT real devices
+# Type 6 = sudo_in (internal boundary), Type 7 = sudo_out (internal boundary)
+PSEUDO_TYPES = {6, 7}
 
 
 def _clone_cktgnn(data_root):
@@ -85,49 +89,98 @@ def _build_node_features(g_full):
     return x
 
 
-def _build_hypergraph_from_subgraph(g_sub, g_full):
+def _get_block_devices(g_sub, g_full):
     """
-    Build hypergraph incidence using subcircuit block membership.
+    Reconstruct block → device mapping using core types from subg_ntypes.
 
-    Each subcircuit block in g_sub expands into constituent devices in g_full.
-    We reconstruct block→device membership by matching the ordered expansion:
-    the subgraph DAG nodes expand sequentially into the full DAG nodes.
+    Each block's subg_ntypes contains [sudo_in(6), real_types..., sudo_out(7)].
+    Filtering out pseudo-types (6, 7) gives core device types whose count
+    matches g_full device count exactly (verified 100% on dataset).
 
-    Falls back to star expansion if the mapping fails.
+    Returns:
+        block_devices: dict {block_id: [device_indices]}
+        success: bool
     """
     num_full = g_full.vcount()
-    num_sub = g_sub.vcount()
 
-    # Reconstruct block membership: each subgraph node has subg_ntypes
-    # listing the device types it contains. The full graph nodes appear
-    # in the same order as the expansion of subgraph nodes.
-    node_list = []
-    hedge_list = []
-
-    # Count how many devices each subgraph block produces
     block_sizes = []
     for v in g_sub.vs:
         ntypes = v["subg_ntypes"]
-        block_sizes.append(len(ntypes) if isinstance(ntypes, (list, tuple)) else 1)
+        if isinstance(ntypes, (list, tuple)):
+            core = [t for t in ntypes if t not in PSEUDO_TYPES]
+            block_sizes.append(len(core))
+        else:
+            block_sizes.append(1)
 
-    total_from_blocks = sum(block_sizes)
+    if sum(block_sizes) != num_full:
+        return None, False
 
-    if total_from_blocks == num_full:
-        # Perfect match: assign devices to blocks sequentially
-        offset = 0
-        for block_id, size in enumerate(block_sizes):
-            for i in range(size):
-                node_list.append(offset + i)
-                hedge_list.append(block_id)
-            offset += size
-    else:
-        # Fallback: star expansion on the full DAG
+    block_devices = {}
+    offset = 0
+    for block_id, size in enumerate(block_sizes):
+        block_devices[block_id] = list(range(offset, offset + size))
+        offset += size
+
+    return block_devices, True
+
+
+def _build_hypergraph_block(g_sub, g_full):
+    """
+    Strategy A: Block-only hyperedges.
+    Each subcircuit block = one hyperedge containing its core devices.
+    """
+    block_devices, ok = _get_block_devices(g_sub, g_full)
+    if not ok:
         return _star_expansion(g_full)
 
-    node_indices = torch.tensor(node_list, dtype=torch.long)
-    hedge_indices = torch.tensor(hedge_list, dtype=torch.long)
-    num_hedges = num_sub
-    return node_indices, hedge_indices, num_hedges
+    node_list = []
+    hedge_list = []
+    for block_id, devices in block_devices.items():
+        for dev in devices:
+            node_list.append(dev)
+            hedge_list.append(block_id)
+
+    num_hedges = g_sub.vcount()
+    return (torch.tensor(node_list, dtype=torch.long),
+            torch.tensor(hedge_list, dtype=torch.long),
+            num_hedges)
+
+
+def _build_hypergraph_block_and_bridge(g_sub, g_full):
+    """
+    Strategy B: Block hyperedges + bridge hyperedges for inter-block connections.
+
+    - Block hyperedges: same as Strategy A
+    - Bridge hyperedges: for each edge (block_i, block_j) in g_sub,
+      create a hyperedge containing devices from both blocks
+    """
+    block_devices, ok = _get_block_devices(g_sub, g_full)
+    if not ok:
+        return _star_expansion(g_full)
+
+    node_list = []
+    hedge_list = []
+
+    # Block hyperedges (IDs: 0 .. num_blocks-1)
+    num_blocks = g_sub.vcount()
+    for block_id, devices in block_devices.items():
+        for dev in devices:
+            node_list.append(dev)
+            hedge_list.append(block_id)
+
+    # Bridge hyperedges (IDs: num_blocks .. num_blocks + num_sub_edges - 1)
+    hedge_id = num_blocks
+    for src_block, dst_block in g_sub.get_edgelist():
+        bridge_members = block_devices[src_block] + block_devices[dst_block]
+        for dev in bridge_members:
+            node_list.append(dev)
+            hedge_list.append(hedge_id)
+        hedge_id += 1
+
+    num_hedges = hedge_id
+    return (torch.tensor(node_list, dtype=torch.long),
+            torch.tensor(hedge_list, dtype=torch.long),
+            num_hedges)
 
 
 def _star_expansion(g):
@@ -151,15 +204,22 @@ def _star_expansion(g):
             num_nodes)
 
 
-def _convert_single(sample, perf, idx):
+def _build_hypergraph(g_sub, g_full, strategy="block_and_bridge"):
+    """Dispatch to the appropriate hypergraph construction strategy."""
+    if strategy == "block":
+        return _build_hypergraph_block(g_sub, g_full)
+    elif strategy == "block_and_bridge":
+        return _build_hypergraph_block_and_bridge(g_sub, g_full)
+    elif strategy == "star":
+        return _star_expansion(g_full)
+    else:
+        raise ValueError(f"Unknown hypergraph strategy: {strategy}")
+
+
+def _convert_single(sample, perf, idx, strategy="block_and_bridge"):
     """
     Convert a single igraph sample + performance record into a
     hypergraph Data object.
-
-    Args:
-        sample: tuple (g_subgraph, g_full) of igraph graphs
-        perf: dict with gain, bw, pm, fom, valid
-        idx: circuit index
     """
     g_sub, g_full = sample
 
@@ -173,9 +233,9 @@ def _convert_single(sample, perf, idx):
     # Make edges undirected for GCN baseline
     edge_index_undir = torch.cat([edge_index, edge_index.flip(0)], dim=1)
 
-    # Hypergraph incidence from subcircuit blocks
-    node_indices, hedge_indices, num_hedges = _build_hypergraph_from_subgraph(
-        g_sub, g_full
+    # Hypergraph incidence
+    node_indices, hedge_indices, num_hedges = _build_hypergraph(
+        g_sub, g_full, strategy=strategy
     )
 
     # Targets
@@ -187,8 +247,8 @@ def _convert_single(sample, perf, idx):
 
     data = Data(
         x=x,
-        edge_index=edge_index_undir,  # undirected for baseline GCN
-        edge_index_directed=edge_index,  # original DAG edges
+        edge_index=edge_index_undir,
+        edge_index_directed=edge_index,
         node_indices=node_indices,
         hedge_indices=hedge_indices,
         num_hedges=num_hedges,
@@ -204,20 +264,21 @@ class OCBDataset(InMemoryDataset):
     """
     Open Circuit Benchmark dataset wrapped as a PyG InMemoryDataset.
 
-    Uses the igraph-format pickle (ckt_bench_XXX.pkl) which is compatible
-    across PyG versions.
-
     Args:
         root: Root directory for data storage.
         bench: '101' or '301' (Ckt-Bench variant).
         valid_only: If True, keep only circuits with valid=1.
+        strategy: Hypergraph construction strategy
+                  ("block", "block_and_bridge", "star").
         transform, pre_transform: Standard PyG transforms.
     """
 
     def __init__(self, root, bench="101", valid_only=True,
+                 strategy="block_and_bridge",
                  transform=None, pre_transform=None):
         self.bench = bench
         self.valid_only = valid_only
+        self.strategy = strategy
         super().__init__(root, transform, pre_transform)
         self.load(self.processed_paths[0])
 
@@ -229,7 +290,7 @@ class OCBDataset(InMemoryDataset):
     @property
     def processed_file_names(self):
         suffix = "valid" if self.valid_only else "all"
-        return [f"ocb_{self.bench}_{suffix}.pt"]
+        return [f"ocb_{self.bench}_{suffix}_{self.strategy}.pt"]
 
     def download(self):
         cktgnn_dir = _clone_cktgnn(self.root)
@@ -262,24 +323,26 @@ class OCBDataset(InMemoryDataset):
             perf = perf_records[idx]
             if self.valid_only and perf["valid"] != 1:
                 continue
-            data = _convert_single(sample, perf, idx)
+            data = _convert_single(sample, perf, idx, strategy=self.strategy)
             if self.pre_transform is not None:
                 data = self.pre_transform(data)
             data_list.append(data)
 
         print(f"Processed {len(data_list)} circuits "
-              f"(filtered from {len(all_samples)} total)")
+              f"(strategy={self.strategy}, filtered from {len(all_samples)} total)")
         self.save(data_list, self.processed_paths[0])
 
 
-def load_ocb_splits(root, bench="101", valid_only=True, train_ratio=0.8,
-                    val_ratio=0.1, batch_size=64, seed=42):
+def load_ocb_splits(root, bench="101", valid_only=True,
+                    strategy="block_and_bridge",
+                    train_ratio=0.8, val_ratio=0.1, batch_size=64, seed=42):
     """
     Convenience function: load OCB data and return train/val/test DataLoaders.
     """
-    dataset = OCBDataset(root=root, bench=bench, valid_only=valid_only)
+    dataset = OCBDataset(root=root, bench=bench, valid_only=valid_only,
+                         strategy=strategy)
     n = len(dataset)
-    print(f"OCB-{bench}: {n} circuits loaded")
+    print(f"OCB-{bench}: {n} circuits loaded (strategy={strategy})")
 
     # Deterministic shuffle
     gen = torch.Generator().manual_seed(seed)

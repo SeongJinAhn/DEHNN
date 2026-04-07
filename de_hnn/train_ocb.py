@@ -122,6 +122,9 @@ def main():
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--sigma", type=float, default=1.0)
+    parser.add_argument("--hypergraph_strategy", type=str, default="block_and_bridge",
+                        choices=["block", "block_and_bridge", "star"],
+                        help="Hypergraph construction strategy")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
@@ -143,6 +146,7 @@ def main():
     print(f"{'='*60}")
     train_loader, val_loader, test_loader, dataset = load_ocb_splits(
         root=args.data_root, bench=args.bench,
+        strategy=args.hypergraph_strategy,
         batch_size=args.batch_size, seed=args.seed,
     )
 
