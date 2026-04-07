@@ -38,7 +38,7 @@ class SheafGNN_node(nn.Module):
     """
 
     def __init__(self, num_layer, emb_dim, out_node_dim, out_net_dim,
-                 stalk_dim=4,
+                 stalk_dim=4, rank=8,
                  JK="concat", residual=True,
                  norm_type="layer", aggr="add",
                  node_dim=None, net_dim=None,
@@ -51,6 +51,7 @@ class SheafGNN_node(nn.Module):
         self.out_node_dim = out_node_dim
         self.out_net_dim = out_net_dim
         self.stalk_dim = stalk_dim
+        self.rank = rank
         self.vn = vn
         self.trans = trans
 
@@ -109,7 +110,7 @@ class SheafGNN_node(nn.Module):
             self.convs.append(
                 SheafBipartiteConv(
                     emb_dim, emb_dim,
-                    stalk_dim=stalk_dim, aggr=aggr
+                    rank=rank, aggr=aggr
                 )
             )
             if norm_type == "batch":
@@ -135,6 +136,7 @@ class SheafGNN_node(nn.Module):
         Returns:
             h_inst: [N, out_node_dim] node predictions
             h_net: [M, out_net_dim] net predictions
+            consistency_loss: scalar, sheaf regularization (0 if not training)
         """
         h_inst = data['node'].x.to(device)
         h_net = data['net'].x.to(device)
@@ -162,19 +164,22 @@ class SheafGNN_node(nn.Module):
             virtualnode_embedding = self.virtualnode_encoder(data.vn.to(device))
 
         # Message passing layers
+        total_consistency_loss = 0.0
         for layer in range(self.num_layer):
             if self.vn:
                 h_inst = self.back_virtualnode_list[layer](
                     torch.concat([h_inst, virtualnode_embedding[batch]], dim=1)
                 ) + h_inst
 
-            h_inst, h_net = self.convs[layer](
+            h_inst, h_net, c_loss = self.convs[layer](
                 h_inst, h_net,
                 edge_index_node_to_net, edge_weight_node_to_net,
                 edge_type_node_to_net,
                 edge_index_net_to_node, edge_weight_net_to_node,
                 device
             )
+            total_consistency_loss = total_consistency_loss + c_loss
+
             h_inst = self.norms[layer](h_inst)
             h_net = self.norms[layer](h_net)
             h_inst = nn.functional.leaky_relu(h_inst)
@@ -194,4 +199,4 @@ class SheafGNN_node(nn.Module):
         # Output
         h_inst = self.fc2_node(nn.functional.leaky_relu(self.fc1_node(h_inst)))
         h_net = self.fc2_net(nn.functional.leaky_relu(self.fc1_net(h_net)))
-        return h_inst, h_net
+        return h_inst, h_net, total_consistency_loss
