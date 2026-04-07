@@ -52,8 +52,8 @@ class SheafBipartiteConv(nn.Module):
         self.map_source = Linear(out_channels * 2, d)
 
         # Learnable diffusion step sizes
-        self.sigma_node = nn.Parameter(torch.tensor(0.1))
-        self.sigma_net = nn.Parameter(torch.tensor(0.1))
+        self.sigma_node = nn.Parameter(torch.tensor(0.5))
+        self.sigma_net = nn.Parameter(torch.tensor(0.5))
 
         # Post-diffusion transform
         self.post_node = Seq(Linear(out_channels, out_channels), ReLU(),
@@ -80,9 +80,9 @@ class SheafBipartiteConv(nn.Module):
         f = torch.zeros(E, d, device=device)
 
         if sink_mask.any():
-            f[sink_mask] = torch.sigmoid(self.map_sink(pair_feat[sink_mask]))
+            f[sink_mask] = self.map_sink(pair_feat[sink_mask])  # [E_sink, d]
         if source_mask.any():
-            f[source_mask] = torch.sigmoid(self.map_source(pair_feat[source_mask]))
+            f[source_mask] = self.map_source(pair_feat[source_mask])  # [E_src, d]
 
         del pair_feat
         return f
