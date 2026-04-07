@@ -118,6 +118,13 @@ class SheafBipartiteConv(nn.Module):
         """
         Args: Same interface as HyperConvLayer for drop-in compatibility.
         """
+        # Move all inputs to device
+        edge_index_node_to_net = edge_index_node_to_net.to(device)
+        edge_weight_node_to_net = edge_weight_node_to_net.to(device)
+        edge_type_node_to_net = edge_type_node_to_net.to(device)
+        edge_index_net_to_node = edge_index_net_to_node.to(device)
+        edge_weight_net_to_node = edge_weight_net_to_node.to(device)
+
         num_nodes = x.size(0)
         num_nets = x_net.size(0)
         d = self.stalk_dim
@@ -146,7 +153,7 @@ class SheafBipartiteConv(nn.Module):
         ).squeeze(-1)  # [E, d]
 
         # Weight by edge weight
-        Fh_weighted = Fh * edge_weight_node_to_net.unsqueeze(-1).to(device)
+        Fh_weighted = Fh * edge_weight_node_to_net.unsqueeze(-1)
 
         # Aggregate per net, split by edge type
         source_mask = edge_type_node_to_net == 1
@@ -182,7 +189,7 @@ class SheafBipartiteConv(nn.Module):
             h_net_stalk_updated[net_idx_bwd].unsqueeze(-1)
         ).squeeze(-1)  # [E, d]
 
-        FTh_weighted = FTh * edge_weight_net_to_node.unsqueeze(-1).to(device)
+        FTh_weighted = FTh * edge_weight_net_to_node.unsqueeze(-1)
 
         # Aggregate per node, split by edge type
         h_sink_sheaf = scatter(
