@@ -108,8 +108,7 @@ class SheafGNN_node(nn.Module):
         for layer in range(num_layer):
             self.convs.append(
                 SheafBipartiteConv(
-                    emb_dim, emb_dim,
-                    stalk_dim=stalk_dim, aggr=aggr
+                    emb_dim, emb_dim, aggr=aggr
                 )
             )
             if norm_type == "batch":

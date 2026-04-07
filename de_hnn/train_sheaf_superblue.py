@@ -130,6 +130,7 @@ def train_epoch(model, h_dataset, train_indices, optimizer,
             loss_net = criterion_net(net_pred, target_net_demand.to(device))
             loss = loss_node + loss_net
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             loss_node_total += loss_node.item()
