@@ -60,8 +60,8 @@ learning_rate = 0.001
 
 # Sheaf ODE hyperparameters
 ode_T = 1.0            # ODE integration time
-ode_tol = 1e-3         # ODE solver tolerance
-ode_method = 'dopri5'  # ODE solver method: 'dopri5', 'euler', 'rk4'
+ode_tol = 1e-2         # ODE solver tolerance (higher = faster)
+ode_method = 'euler'   # ODE solver method: 'euler' (fast), 'rk4', 'dopri5' (slow)
 
 # Subgraph sampling (helps when number of graphs is small)
 use_subgraph = False   # partition-based subgraph sampling
