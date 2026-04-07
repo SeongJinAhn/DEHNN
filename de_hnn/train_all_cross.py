@@ -50,8 +50,8 @@ if test:
     restart = True
 
 model_type = "dehnn" # one of ["dehnn", "dehnn_att", "digcn", "digat", "sheaf_ode", "cell_complex", "cell_complex_att"]
-num_layer = 3 #large number will cause OOM
-num_dim = 32 #large number will cause OOM
+num_layer = 2 #large number will cause OOM
+num_dim = 16 #large number will cause OOM
 vn = False #use virtual node or not
 trans = False #use transformer or not
 aggr = "add" #use aggregation as one of ["add", "max"]
