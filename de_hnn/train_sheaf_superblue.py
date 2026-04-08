@@ -318,46 +318,46 @@ def main():
     print(f"Device: {device}")
 
     # ── Data ──
-    cache_suffix = "_partition" if args.mode == "partition" else ""
-    cache_path = args.cache.replace(".pt", f"{cache_suffix}.pt")
+    full_cache = args.cache  # e.g. h_dataset_sheaf.pt
+    partition_cache = args.cache.replace(".pt", "_partition.pt")
 
-    if args.reload and os.path.exists(cache_path):
-        print(f"Loading cached dataset from {cache_path}")
-        h_dataset = torch.load(cache_path)
-    else:
-        print(f"Processing dataset from {args.data_dir} (mode={args.mode})")
-        if args.mode == "partition":
-            h_dataset = build_h_dataset_partition(args.data_dir, cache_path)
-        else:
-            h_dataset = build_h_dataset(args.data_dir, cache_path)
-
-    print(f"Loaded {len(h_dataset)} samples (mode={args.mode})")
-    for i, d in enumerate(h_dataset):
-        print(f"  [{i}] {d['design_name']}: "
-              f"nodes={d['node'].x.shape[0]:,}, "
-              f"nets={d['net'].x.shape[0]:,}, "
-              f"edges={d['node', 'to', 'net'].edge_index.shape[1]:,}")
-
-    # ── Splits ──
     if args.mode == "partition":
-        # Design-level split: don't mix partitions from same design
-        design_ids = [d['design_idx'] for d in h_dataset]
-        unique_designs = sorted(set(design_ids))
-        train_designs = set(unique_designs[:10])
-        val_designs = set(unique_designs[10:])
-        train_indices = [i for i, did in enumerate(design_ids) if did in train_designs]
-        val_indices = [i for i, did in enumerate(design_ids) if did in val_designs]
+        # Train: partition subgraphs
+        if args.reload and os.path.exists(partition_cache):
+            print(f"Loading cached partition dataset from {partition_cache}")
+            h_dataset_train = torch.load(partition_cache)
+        else:
+            print(f"Processing partition dataset from {args.data_dir}")
+            h_dataset_train = build_h_dataset_partition(args.data_dir, partition_cache)
+        train_indices = list(range(len(h_dataset_train)))
+
+        # Val/Test: full graphs
+        if args.reload and os.path.exists(full_cache):
+            print(f"Loading cached full dataset from {full_cache}")
+            h_dataset_val = torch.load(full_cache)
+        else:
+            print(f"Processing full dataset from {args.data_dir}")
+            h_dataset_val = build_h_dataset(args.data_dir, full_cache)
+        val_indices = list(range(len(h_dataset_val)))
         test_indices = val_indices
-        print(f"  Train: {len(train_indices)} subgraphs from {len(train_designs)} designs")
-        print(f"  Val:   {len(val_indices)} subgraphs from {len(val_designs)} designs")
+
+        print(f"Train: {len(h_dataset_train)} partition subgraphs")
+        print(f"Val/Test: {len(h_dataset_val)} full graphs")
     else:
-        all_indices = list(range(len(h_dataset)))
-        train_indices = all_indices[:10]
-        val_indices = all_indices[10:]
-        test_indices = all_indices[10:]
+        # Full mode: single dataset
+        if args.reload and os.path.exists(full_cache):
+            print(f"Loading cached dataset from {full_cache}")
+            h_dataset_train = torch.load(full_cache)
+        else:
+            print(f"Processing dataset from {args.data_dir}")
+            h_dataset_train = build_h_dataset(args.data_dir, full_cache)
+        h_dataset_val = h_dataset_train
+        train_indices = list(range(min(10, len(h_dataset_train))))
+        val_indices = list(range(10, len(h_dataset_train)))
+        test_indices = val_indices
 
     # ── Model ──
-    h_data = h_dataset[0]
+    h_data = h_dataset_train[0]
     model_name = f"sheaf_{args.mode}_{args.num_layer}_{args.num_dim}_{args.stalk_dim}_{args.vn}_{args.trans}_model.pt"
 
     if args.test or args.restart:
@@ -386,7 +386,7 @@ def main():
     # ── Test mode ──
     if args.test:
         test_node, test_net = eval_epoch(
-            model, h_dataset, test_indices,
+            model, h_dataset_val, test_indices,
             criterion_node, criterion_net, device
         )
         print(f"Test node demand MSE: {test_node:.6f}")
@@ -403,12 +403,12 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_node, train_net = train_epoch(
-            model, h_dataset, train_indices,
+            model, h_dataset_train, train_indices,
             optimizer, criterion_node, criterion_net, device
         )
 
         val_node, val_net = eval_epoch(
-            model, h_dataset, val_indices,
+            model, h_dataset_val, val_indices,
             criterion_node, criterion_net, device
         )
 
