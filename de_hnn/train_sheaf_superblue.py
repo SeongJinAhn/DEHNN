@@ -102,6 +102,120 @@ def build_h_dataset(data_dir, save_path):
     return h_dataset
 
 
+def build_h_dataset_partition(data_dir, save_path):
+    """Split each design into METIS partitions as separate training samples."""
+    dataset = NetlistDataset(
+        data_dir=data_dir, load_pe=True, pl=True,
+        processed=True, load_indices=None
+    )
+
+    h_dataset = []
+    for design_idx, data in enumerate(tqdm(dataset, desc="Processing designs")):
+        num_instances = data.node_features.shape[0]
+        data.num_instances = num_instances
+        data.edge_index_sink_to_net[1] -= num_instances
+        data.edge_index_source_to_net[1] -= num_instances
+
+        # Filter high-degree nets (>3000 connections)
+        out_degrees = data.net_features[:, 1]
+        mask = out_degrees < 3000
+        mask_src = mask[data.edge_index_source_to_net[1]]
+        data.edge_index_source_to_net = data.edge_index_source_to_net[:, mask_src]
+        mask_sink = mask[data.edge_index_sink_to_net[1]]
+        data.edge_index_sink_to_net = data.edge_index_sink_to_net[:, mask_sink]
+
+        # Original edges (before gcn_norm) for subgraph extraction
+        sink_edges = data.edge_index_sink_to_net   # [2, E_sink]
+        source_edges = data.edge_index_source_to_net  # [2, E_source]
+
+        part_ids = data.batch  # METIS partition IDs, len = num_instances
+        unique_pids = torch.unique(part_ids)
+
+        for pid in unique_pids:
+            node_mask = (part_ids == pid)
+            node_indices = node_mask.nonzero(as_tuple=False).squeeze(1)
+
+            # Filter edges: keep only edges where the node belongs to this partition
+            sink_node_mask = node_mask[sink_edges[0]]
+            sub_sink = sink_edges[:, sink_node_mask]
+
+            src_node_mask = node_mask[source_edges[0]]
+            sub_source = source_edges[:, src_node_mask]
+
+            # Find all nets connected to this partition's nodes
+            relevant_net_ids = torch.cat([sub_sink[1], sub_source[1]]).unique()
+
+            if len(node_indices) == 0 or len(relevant_net_ids) == 0:
+                continue
+
+            # Remap node indices: old -> 0..n-1
+            node_remap = torch.full((num_instances,), -1, dtype=torch.long)
+            node_remap[node_indices] = torch.arange(len(node_indices))
+
+            # Remap net indices: old -> 0..m-1
+            num_nets = data.net_features.shape[0]
+            net_remap = torch.full((num_nets,), -1, dtype=torch.long)
+            net_remap[relevant_net_ids] = torch.arange(len(relevant_net_ids))
+
+            # Remap edge indices
+            sub_sink_remapped = torch.stack([
+                node_remap[sub_sink[0]],
+                net_remap[sub_sink[1]]
+            ])
+            sub_source_remapped = torch.stack([
+                node_remap[sub_source[0]],
+                net_remap[sub_source[1]]
+            ])
+
+            # Build HeteroData for this subgraph
+            h_data = HeteroData()
+            h_data['node'].x = data.node_features[node_indices]
+            h_data['net'].x = data.net_features[relevant_net_ids]
+
+            edge_index = torch.cat([sub_sink_remapped, sub_source_remapped], dim=1)
+            h_data['node', 'to', 'net'].edge_index, \
+                h_data['node', 'to', 'net'].edge_weight = gcn_norm(edge_index, add_self_loops=False)
+            h_data['node', 'to', 'net'].edge_type = torch.cat([
+                torch.zeros(sub_sink_remapped.shape[1]),
+                torch.ones(sub_source_remapped.shape[1])
+            ]).bool()
+            h_data['net', 'to', 'node'].edge_index, \
+                h_data['net', 'to', 'node'].edge_weight = gcn_norm(edge_index.flip(0), add_self_loops=False)
+
+            h_data['design_name'] = data['design_name']
+            h_data['design_idx'] = design_idx
+            h_data.num_instances = len(node_indices)
+
+            # Targets (normalized per subgraph)
+            node_demand = data.node_demand[node_indices]
+            net_demand = data.net_demand[relevant_net_ids]
+            net_hpwl = data.net_hpwl[relevant_net_ids]
+
+            std_nd = torch.std(node_demand)
+            node_demand = (node_demand - torch.mean(node_demand)) / max(std_nd, 1e-6)
+            std_nh = torch.std(net_hpwl)
+            net_hpwl = (net_hpwl - torch.mean(net_hpwl)) / max(std_nh, 1e-6)
+            std_netd = torch.std(net_demand)
+            net_demand = (net_demand - torch.mean(net_demand)) / max(std_netd, 1e-6)
+
+            # VN: single cluster for subgraph
+            batch = torch.zeros(len(node_indices), dtype=torch.long)
+            num_vn = 1
+            vn_node = torch.cat([
+                global_mean_pool(h_data['node'].x, batch),
+                global_max_pool(h_data['node'].x, batch)
+            ], dim=1)
+
+            h_data['variant_data_lst'] = [
+                (node_demand, net_hpwl, net_demand, batch, num_vn, vn_node)
+            ]
+            h_dataset.append(h_data)
+
+    torch.save(h_dataset, save_path)
+    print(f"Saved {len(h_dataset)} partition subgraphs to {save_path}")
+    return h_dataset
+
+
 def train_epoch(model, h_dataset, train_indices, optimizer,
                 criterion_node, criterion_net, device):
     """Train one epoch over all training designs."""
@@ -182,6 +296,9 @@ def main():
                         help="Test mode (load trained model, evaluate only)")
     parser.add_argument("--restart", action="store_true",
                         help="Resume training from saved model")
+    parser.add_argument("--mode", type=str, default="full",
+                        choices=["full", "partition"],
+                        help="full: 1 design = 1 sample, partition: split by METIS")
 
     # Model hyperparameters
     parser.add_argument("--num_layer", type=int, default=3)
@@ -201,14 +318,20 @@ def main():
     print(f"Device: {device}")
 
     # ── Data ──
-    if args.reload and os.path.exists(args.cache):
-        print(f"Loading cached dataset from {args.cache}")
-        h_dataset = torch.load(args.cache)
-    else:
-        print(f"Processing dataset from {args.data_dir}")
-        h_dataset = build_h_dataset(args.data_dir, args.cache)
+    cache_suffix = "_partition" if args.mode == "partition" else ""
+    cache_path = args.cache.replace(".pt", f"{cache_suffix}.pt")
 
-    print(f"Loaded {len(h_dataset)} designs")
+    if args.reload and os.path.exists(cache_path):
+        print(f"Loading cached dataset from {cache_path}")
+        h_dataset = torch.load(cache_path)
+    else:
+        print(f"Processing dataset from {args.data_dir} (mode={args.mode})")
+        if args.mode == "partition":
+            h_dataset = build_h_dataset_partition(args.data_dir, cache_path)
+        else:
+            h_dataset = build_h_dataset(args.data_dir, cache_path)
+
+    print(f"Loaded {len(h_dataset)} samples (mode={args.mode})")
     for i, d in enumerate(h_dataset):
         print(f"  [{i}] {d['design_name']}: "
               f"nodes={d['node'].x.shape[0]:,}, "
@@ -216,14 +339,26 @@ def main():
               f"edges={d['node', 'to', 'net'].edge_index.shape[1]:,}")
 
     # ── Splits ──
-    all_indices = list(range(len(h_dataset)))
-    train_indices = all_indices[:10]
-    val_indices = all_indices[10:]
-    test_indices = all_indices[10:]
+    if args.mode == "partition":
+        # Design-level split: don't mix partitions from same design
+        design_ids = [d['design_idx'] for d in h_dataset]
+        unique_designs = sorted(set(design_ids))
+        train_designs = set(unique_designs[:10])
+        val_designs = set(unique_designs[10:])
+        train_indices = [i for i, did in enumerate(design_ids) if did in train_designs]
+        val_indices = [i for i, did in enumerate(design_ids) if did in val_designs]
+        test_indices = val_indices
+        print(f"  Train: {len(train_indices)} subgraphs from {len(train_designs)} designs")
+        print(f"  Val:   {len(val_indices)} subgraphs from {len(val_designs)} designs")
+    else:
+        all_indices = list(range(len(h_dataset)))
+        train_indices = all_indices[:10]
+        val_indices = all_indices[10:]
+        test_indices = all_indices[10:]
 
     # ── Model ──
     h_data = h_dataset[0]
-    model_name = f"sheaf_{args.num_layer}_{args.num_dim}_{args.stalk_dim}_{args.vn}_{args.trans}_model.pt"
+    model_name = f"sheaf_{args.mode}_{args.num_layer}_{args.num_dim}_{args.stalk_dim}_{args.vn}_{args.trans}_model.pt"
 
     if args.test or args.restart:
         print(f"Loading model from {model_name}")
