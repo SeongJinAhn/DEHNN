@@ -201,22 +201,41 @@ def build_h_dataset_partition(data_dir, save_path):
 
 
 ### hyperparameter ###
-test = False # if only test but not train
-restart = False # if restart training
-reload_dataset = False # if reload already processed h_dataset
-mode = "full"  # "full" or "partition"
+import argparse
+parser = argparse.ArgumentParser(description="Train GNN on Superblue")
+parser.add_argument("--test", action="store_true", help="Test mode only")
+parser.add_argument("--restart", action="store_true", help="Resume training")
+parser.add_argument("--reload", action="store_true", help="Reload cached dataset")
+parser.add_argument("--mode", type=str, default="full", choices=["full", "partition"],
+                    help="full: 1 design = 1 sample, partition: split by METIS")
+parser.add_argument("--model_type", type=str, default="dehnn",
+                    choices=["dehnn", "dehnn_att", "digcn", "digat"])
+parser.add_argument("--num_layer", type=int, default=3)
+parser.add_argument("--num_dim", type=int, default=32)
+parser.add_argument("--vn", action="store_true", help="Use virtual node")
+parser.add_argument("--trans", action="store_true", help="Use transformer")
+parser.add_argument("--aggr", type=str, default="add", choices=["add", "max"])
+parser.add_argument("--device", type=str, default="cuda")
+parser.add_argument("--lr", type=float, default=0.001)
+parser.add_argument("--epochs", type=int, default=500)
+args = parser.parse_args()
+
+test = args.test
+restart = args.restart
+reload_dataset = args.reload
+mode = args.mode
 
 if test:
     restart = True
 
-model_type = "dehnn" #this can be one of ["dehnn", "dehnn_att", "digcn", "digat"] "dehnn_att" might need large memory usage
-num_layer = 3 #large number will cause OOM
-num_dim = 32 #large number will cause OOM
-vn = False #use virtual node or not
-trans = False #use transformer or not
-aggr = "add" #use aggregation as one of ["add", "max"]
-device = "cuda" #use cuda or cpu
-learning_rate = 0.001
+model_type = args.model_type
+num_layer = args.num_layer
+num_dim = args.num_dim
+vn = args.vn
+trans = args.trans
+aggr = args.aggr
+device = args.device
+learning_rate = args.lr
 
 # ── Data ──
 full_cache = "h_dataset.pt"
@@ -282,7 +301,7 @@ if not test:
           f"{'Val Node':>11} | {'Val Net':>11} | {'Best':>6}")
     print("-" * 70)
 
-    for epoch in range(500):
+    for epoch in range(args.epochs):
         np.random.shuffle(all_train_indices)
         loss_node_all = 0
         loss_net_all = 0
