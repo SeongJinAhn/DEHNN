@@ -2,13 +2,16 @@
 Sheaf Hypergraph Neural Network for Circuit Performance Prediction.
 
 Implements:
-  1. SheafBuilder — learns restriction maps F_{v←e} for each (node, hyperedge)
-  2. SheafHyperConv — one layer of sheaf Laplacian diffusion on hypergraphs
-  3. SheafCircuitModel — full model with encoder, sheaf conv stack, readout, MLP head
+  1. SheafBuilder — learns restriction maps F_{v←e} for each (node, hyperedge)  [B3: generic]
+  2. TypedRestriction — role-typed restriction maps (B1: typed, B2: physics-hard, B4: physics-soft)
+  3. SheafHyperConv — one layer of sheaf Laplacian diffusion on hypergraphs
+  4. SheafCircuitModel — full model with encoder, sheaf conv stack, readout, MLP head
 
-The sheaf Laplacian is:  L = delta^T @ D_e^{-1} @ delta
-where delta is the coboundary map built from the learned restriction maps.
-Diffusion:  H' = H - sigma * L @ H   (explicit Euler step)
+Ablation modes for restriction maps:
+  - "generic"  (B3): MLP(h_v, h_e) → d×d per incidence (Duta'23 style)
+  - "typed"    (B1): R[tau(v)] → one d×d matrix per role type
+  - "physics"  (B2): hard constraints — gate=low-rank proj, drain-source involution tie
+  - "physics_soft" (B4): init with physics structure + regularizer, but learnable
 """
 
 import torch
@@ -18,14 +21,12 @@ from torch_geometric.nn import global_mean_pool, global_add_pool
 from torch_geometric.utils import scatter
 
 
-# ── Sheaf Builder ────────────────────────────────────────────────────────────
+# ── Sheaf Builder (B3: Generic Learned) ─────────────────────────────────────
 
 class SheafBuilder(nn.Module):
     """
     Learns d×d restriction maps F_{v←e} for each node-hyperedge incidence.
-
-    Given node features h_v and a hyperedge feature (mean of member nodes),
-    produces a d×d matrix via an MLP.
+    This is the generic baseline (B3) — most expressive, no structural prior.
     """
 
     def __init__(self, input_dim, stalk_dim, hidden_dim=64):
@@ -37,28 +38,105 @@ class SheafBuilder(nn.Module):
             nn.Linear(hidden_dim, stalk_dim * stalk_dim),
         )
 
-    def forward(self, x, node_indices, hedge_indices, num_hedges):
+    def forward(self, x, node_indices, hedge_indices, num_hedges, tau=None):
+        d = self.stalk_dim
+        hedge_feat = scatter(x[node_indices], hedge_indices, dim=0,
+                             dim_size=num_hedges, reduce="mean")
+        pair_feat = torch.cat([x[node_indices], hedge_feat[hedge_indices]], dim=-1)
+        maps = self.mlp(pair_feat).view(-1, d, d)
+        return maps, torch.tensor(0.0, device=x.device)
+
+
+# ── Typed Restriction (B1/B2/B4: Role-Structured) ──────────────────────────
+
+class TypedRestriction(nn.Module):
+    """
+    Restriction maps structured by terminal role.
+
+    Modes:
+      "typed"        (B1): one free d×d matrix per role — no physics constraint
+      "physics"      (B2): hard constraints:
+                            - gate (role 0) = low-rank projection
+                            - source (role 2) = involution-conjugate of drain (role 1)
+                            - bulk (role 3) = small-norm
+      "physics_soft" (B4): free matrices initialized with physics structure,
+                            regularized toward physics during training
+    """
+
+    def __init__(self, d, num_roles, mode="typed", gate_rank=None):
+        super().__init__()
+        self.d = d
+        self.mode = mode
+        self.num_roles = num_roles
+        self.gate_rank = gate_rank or max(1, d // 2)
+
+        self.R = nn.Parameter(torch.stack([torch.eye(d) for _ in range(num_roles)]))
+
+        if mode in ("physics", "physics_soft"):
+            self.Pg = nn.Parameter(torch.randn(d, self.gate_rank) * 0.1)
+            sigma = torch.zeros(d, d)
+            for i in range(d):
+                sigma[i, d - 1 - i] = 1.0
+            self.register_buffer('sigma', sigma)
+
+    def _physics_matrices(self):
+        R = self.R.clone()
+        # Gate (role 0): low-rank projection (high-impedance input)
+        Pg = self.Pg
+        PgTPg = Pg.T @ Pg
+        PgTPg_inv = torch.linalg.pinv(PgTPg)
+        proj_g = Pg @ PgTPg_inv @ Pg.T
+        R[0] = proj_g
+
+        # Source (role 2) = sigma @ R_drain @ sigma^T (conduction symmetry)
+        if self.num_roles > 2:
+            R[2] = self.sigma @ R[1] @ self.sigma.T
+
+        # Bulk (role 3): weak coupling
+        if self.num_roles > 3:
+            R[3] = 0.1 * R[3]
+
+        return R
+
+    def _compute_reg(self):
+        """Physics regularizer for soft mode."""
+        Pg = self.Pg
+        PgTPg_inv = torch.linalg.pinv(Pg.T @ Pg)
+        proj_g = Pg @ PgTPg_inv @ Pg.T
+
+        reg = (self.R[0] - proj_g.detach()).pow(2).sum()
+        if self.num_roles > 2:
+            target_s = self.sigma @ self.R[1].detach() @ self.sigma.T
+            reg = reg + (self.R[2] - target_s).pow(2).sum()
+        if self.num_roles > 3:
+            reg = reg + (self.R[3].norm() - 0.1).pow(2)
+        return reg
+
+    def forward(self, tau, node_indices):
         """
         Args:
-            x: [N, input_dim] node features
-            node_indices: [M] node ids for each incidence
-            hedge_indices: [M] hyperedge ids for each incidence
-            num_hedges: int
+            tau: [N] role index for each node
+            node_indices: [M] node IDs for each incidence
 
         Returns:
-            maps: [M, d, d] restriction maps for each incidence
+            maps: [M, d, d] per-incidence restriction maps
+            reg: scalar regularization loss (0 for typed/physics modes)
         """
-        d = self.stalk_dim
+        if self.mode == "typed":
+            R = self.R
+            reg = torch.tensor(0.0, device=R.device)
+        elif self.mode == "physics":
+            R = self._physics_matrices()
+            reg = torch.tensor(0.0, device=R.device)
+        elif self.mode == "physics_soft":
+            R = self.R
+            reg = self._compute_reg()
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
 
-        # Compute hyperedge features as mean of member node features
-        hedge_feat = scatter(x[node_indices], hedge_indices, dim=0,
-                             dim_size=num_hedges, reduce="mean")  # [E, input_dim]
-
-        # For each incidence (v, e), concatenate node feat and hedge feat
-        pair_feat = torch.cat([x[node_indices], hedge_feat[hedge_indices]], dim=-1)  # [M, 2*input_dim]
-
-        maps = self.mlp(pair_feat).view(-1, d, d)  # [M, d, d]
-        return maps
+        per_node_R = R[tau]                 # [N, d, d]
+        maps = per_node_R[node_indices]     # [M, d, d]
+        return maps, reg
 
 
 # ── Sheaf Hypergraph Convolution ─────────────────────────────────────────────
@@ -147,7 +225,15 @@ class SheafCircuitModel(nn.Module):
     Sheaf Hypergraph Neural Network for graph-level circuit prediction.
 
     Architecture:
-        Node encoder → [SheafBuilder + SheafHyperConv + Norm + ReLU] × L → Readout → MLP → targets
+        Node encoder → [SheafBuilder/TypedRestriction + SheafHyperConv + Norm + ReLU] × L
+        → Readout → MLP → targets
+
+    sheaf_mode controls the restriction map:
+        "generic"      (B3): MLP-learned per incidence
+        "typed"        (B1): one matrix per terminal role
+        "physics"      (B2): hard physics constraints
+        "physics_soft" (B4): soft physics constraints + regularizer
+        "identity"     (B0): identity maps (no sheaf)
     """
 
     def __init__(
@@ -156,37 +242,48 @@ class SheafCircuitModel(nn.Module):
         hidden_dim=64,
         stalk_dim=8,
         num_layers=4,
-        output_dim=4,      # [gain, bw, pm, fom]
+        output_dim=4,
         dropout=0.1,
         sigma=1.0,
         readout="mean",
+        sheaf_mode="generic",
+        num_roles=12,
+        gate_rank=None,
     ):
         super().__init__()
         self.stalk_dim = stalk_dim
         self.num_layers = num_layers
         self.dropout = dropout
         self.readout_type = readout
+        self.sheaf_mode = sheaf_mode
 
-        # Node encoder: input_dim → hidden_dim → stalk_dim
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, stalk_dim),
         )
 
-        # Sheaf convolution layers
         self.sheaf_builders = nn.ModuleList()
         self.sheaf_convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.lins = nn.ModuleList()  # post-diffusion linear
+        self.lins = nn.ModuleList()
 
         for _ in range(num_layers):
-            self.sheaf_builders.append(SheafBuilder(stalk_dim, stalk_dim, hidden_dim))
+            if sheaf_mode == "generic":
+                self.sheaf_builders.append(SheafBuilder(stalk_dim, stalk_dim, hidden_dim))
+            elif sheaf_mode in ("typed", "physics", "physics_soft"):
+                self.sheaf_builders.append(TypedRestriction(stalk_dim, num_roles,
+                                                            mode=sheaf_mode,
+                                                            gate_rank=gate_rank))
+            elif sheaf_mode == "identity":
+                self.sheaf_builders.append(None)
+            else:
+                raise ValueError(f"Unknown sheaf_mode: {sheaf_mode}")
+
             self.sheaf_convs.append(SheafHyperConv(stalk_dim, sigma))
             self.norms.append(nn.LayerNorm(stalk_dim))
             self.lins.append(nn.Linear(stalk_dim, stalk_dim))
 
-        # MLP head for graph-level prediction
         self.head = nn.Sequential(
             nn.Linear(stalk_dim, hidden_dim),
             nn.ReLU(),
@@ -198,10 +295,9 @@ class SheafCircuitModel(nn.Module):
 
     def forward(self, data, device=None):
         """
-        Args:
-            data: PyG Batch with x, node_indices, hedge_indices, num_hedges, batch
         Returns:
             pred: [B, output_dim] predictions
+            reg_loss: scalar physics regularization (0 for non-physics modes)
         """
         if device is None:
             device = data.x.device
@@ -210,26 +306,33 @@ class SheafCircuitModel(nn.Module):
         node_indices = data.node_indices.to(device)
         hedge_indices = data.hedge_indices.to(device)
         batch = data.batch.to(device)
+        tau = data.tau.to(device) if hasattr(data, 'tau') and data.tau is not None else None
         num_nodes = x.size(0)
-
-        # Compute num_hedges for the full batch
-        # In batched mode, hedge_indices are already offset by PyG
         num_hedges = int(hedge_indices.max().item()) + 1 if hedge_indices.numel() > 0 else 0
 
-        # Encode
-        H = self.encoder(x)  # [N, stalk_dim]
+        H = self.encoder(x)
+        total_reg = torch.tensor(0.0, device=device)
 
-        # Sheaf diffusion layers
         for i in range(self.num_layers):
-            maps = self.sheaf_builders[i](H, node_indices, hedge_indices, num_hedges)
+            if self.sheaf_mode == "identity":
+                # B0: identity restriction maps
+                num_incidences = node_indices.size(0)
+                maps = torch.eye(self.stalk_dim, device=device).unsqueeze(0).expand(num_incidences, -1, -1)
+                reg = torch.tensor(0.0, device=device)
+            elif self.sheaf_mode == "generic":
+                maps, reg = self.sheaf_builders[i](H, node_indices, hedge_indices, num_hedges, tau)
+            else:
+                maps, reg = self.sheaf_builders[i](tau, node_indices)
+
+            total_reg = total_reg + reg
+
             H_diff = self.sheaf_convs[i](H, maps, node_indices, hedge_indices,
                                           num_nodes, num_hedges)
             H_diff = self.lins[i](H_diff)
             H_diff = self.norms[i](H_diff)
-            H = H + F.relu(H_diff)  # residual
+            H = H + F.relu(H_diff)
             H = F.dropout(H, p=self.dropout, training=self.training)
 
-        # Graph-level readout
         if self.readout_type == "mean":
             graph_emb = global_mean_pool(H, batch)
         elif self.readout_type == "add":
@@ -237,9 +340,8 @@ class SheafCircuitModel(nn.Module):
         else:
             graph_emb = global_mean_pool(H, batch)
 
-        # Predict
         pred = self.head(graph_emb)
-        return pred
+        return pred, total_reg
 
 
 # ── Simple GNN Baseline ──────────────────────────────────────────────────────
